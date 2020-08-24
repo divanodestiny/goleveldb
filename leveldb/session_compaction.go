@@ -30,8 +30,10 @@ func (s *session) pickMemdbLevel(umin, umax []byte, maxLevel int) int {
 
 func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (int, error) {
 	// Create sorted table.
+	// 迭代器
 	iter := mdb.NewIterator(nil)
 	defer iter.Release()
+	// 构建sst文件
 	t, n, err := s.tops.createFrom(iter)
 	if err != nil {
 		return 0, err
@@ -45,6 +47,8 @@ func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (i
 	// higher level, thus maximum possible level is always picked, while
 	// overlapping deletion marker pushed into lower level.
 	// See: https://github.com/syndtr/goleveldb/issues/127.
+	// 选层, 目标是尽量提高将生成的sst的层数, 简单来讲选层的逻辑就是,
+	// 从l0开始, 循环检查mem db的key范围和当前层sst是否有交集, 有交集则选择当前层结束循环
 	flushLevel := s.pickMemdbLevel(t.imin.ukey(), t.imax.ukey(), maxLevel)
 	rec.addTableFile(flushLevel, t)
 
@@ -53,16 +57,18 @@ func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (i
 }
 
 // Pick a compaction based on current state; need external synchronization.
+// 挑选一个compaction计划
 func (s *session) pickCompaction() *compaction {
 	v := s.version()
 
 	var sourceLevel int
 	var t0 tFiles
 	var typ int
-	if v.cScore >= 1 {
+	if v.cScore >= 1 { // cScore大多数时候在mem compaction的时候触发更新
 		sourceLevel = v.cLevel
 		cptr := s.getCompPtr(sourceLevel)
 		tables := v.levels[sourceLevel]
+		// 二分法筛选符合阈值的第一个位置
 		if cptr != nil && sourceLevel > 0 {
 			n := len(tables)
 			if i := sort.Search(n, func(i int) bool {
@@ -71,6 +77,9 @@ func (s *session) pickCompaction() *compaction {
 				t0 = append(t0, tables[i])
 			}
 		}
+
+		// 注意这里每一层都是从第一个文件开始合并
+		// 然后将被选中的文件的最大key放入v.levels中等待下一次本层compaction做范围筛选
 		if len(t0) == 0 {
 			t0 = append(t0, tables[0])
 		}
@@ -80,6 +89,7 @@ func (s *session) pickCompaction() *compaction {
 			typ = nonLevel0Compaction
 		}
 	} else {
+		// 读取时mismatch触发的compaction
 		if p := atomic.LoadPointer(&v.cSeek); p != nil {
 			ts := (*tSet)(p)
 			sourceLevel = ts.level

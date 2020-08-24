@@ -148,11 +148,12 @@ type compactionTransactInterface interface {
 	revert() error
 }
 
+// 事务框架
 func (db *DB) compactionTransact(name string, t compactionTransactInterface) {
 	defer func() {
 		if x := recover(); x != nil {
 			if x == errCompactionTransactExiting {
-				if err := t.revert(); err != nil {
+				if err := t.revert(); err != nil { // 回滚
 					db.logf("%s revert error %q", name, err)
 				}
 			}
@@ -249,6 +250,7 @@ func (t *compactionTransactFunc) revert() error {
 	return nil
 }
 
+// 事务框架
 func (db *DB) compactionTransactFunc(name string, run func(cnt *compactionTransactCounter) error, revert func() error) {
 	db.compactionTransact(name, &compactionTransactFunc{run, revert})
 }
@@ -261,11 +263,13 @@ func (db *DB) compactionCommit(name string, rec *sessionRecord) {
 	db.compCommitLk.Lock()
 	defer db.compCommitLk.Unlock() // Defer is necessary.
 	db.compactionTransactFunc(name+"@commit", func(cnt *compactionTransactCounter) error {
+		// 这里主要是更新manifest文件, 也就是每一层文件的版本信息
 		return db.s.commit(rec, true)
 	}, nil)
 }
 
 func (db *DB) memCompaction() {
+	// immutable mem db
 	mdb := db.getFrozenMem()
 	if mdb == nil {
 		return
@@ -275,6 +279,7 @@ func (db *DB) memCompaction() {
 	db.logf("memdb@flush N·%d S·%s", mdb.Len(), shortenb(mdb.Size()))
 
 	// Don't compact empty memdb.
+	// 空的就结束
 	if mdb.Len() == 0 {
 		db.logf("memdb@flush skipping")
 		// drop frozen memdb
@@ -283,6 +288,8 @@ func (db *DB) memCompaction() {
 	}
 
 	// Pause table compaction.
+	// 暂停major compaction
+	// 因为leveldb没有做过compaction并行优化, 可能导致manifest错误?
 	resumeC := make(chan struct{})
 	select {
 	case db.tcompPauseC <- (chan<- struct{})(resumeC):
@@ -300,12 +307,15 @@ func (db *DB) memCompaction() {
 	)
 
 	// Generate tables.
+	// 生成sst
 	db.compactionTransactFunc("memdb@flush", func(cnt *compactionTransactCounter) (err error) {
+		// 运行
 		stats.startTimer()
 		flushLevel, err = db.s.flushMemdb(rec, mdb.DB, db.memdbMaxLevel)
 		stats.stopTimer()
 		return
 	}, func() error {
+		// 回滚
 		for _, r := range rec.addedTables {
 			db.logf("memdb@flush revert @%d", r.num)
 			if err := db.s.stor.Remove(storage.FileDesc{Type: storage.TypeTable, Num: r.num}); err != nil {
@@ -319,6 +329,7 @@ func (db *DB) memCompaction() {
 	rec.setSeqNum(db.frozenSeq)
 
 	// Commit.
+	// 计时提交
 	stats.startTimer()
 	db.compactionCommit("memdb", rec)
 	stats.stopTimer()
@@ -327,15 +338,19 @@ func (db *DB) memCompaction() {
 
 	// Save compaction stats
 	for _, r := range rec.addedTables {
-		stats.write += r.size
+		stats.write += r.size // 增加的sst大小
 	}
+
+	// 更新指定层的compaction统计信息
 	db.compStats.addStat(flushLevel, stats)
 	atomic.AddUint32(&db.memComp, 1)
 
 	// Drop frozen memdb.
+	// 丢掉已经没用的immutable mem db
 	db.dropFrozenMem()
 
 	// Resume table compaction.
+	// 重新启动major compaction
 	if resumeC != nil {
 		select {
 		case <-resumeC:
@@ -346,6 +361,7 @@ func (db *DB) memCompaction() {
 	}
 
 	// Trigger table compaction.
+	// 主动触发major compaction
 	db.compTrigger(db.tcompCmdC)
 }
 
@@ -588,7 +604,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 	db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), b.kerrCnt, b.dropCnt, stats[1].duration)
 
 	// Save compaction stats
-	for i := range stats {
+	for i := range stats { // 更新compaction之后的状态
 		db.compStats.addStat(c.sourceLevel+1, &stats[i])
 	}
 	switch c.typ {
@@ -754,10 +770,12 @@ func (db *DB) compTriggerRange(compC chan<- cCmd, level int, min, max []byte) (e
 	return err
 }
 
+// mCompaction是minor compaction, 即immutable mem db -> l0 sst
 func (db *DB) mCompaction() {
 	var x cCmd
 
 	defer func() {
+		// 错误处理
 		if x := recover(); x != nil {
 			if x != errCompactionTransactExiting {
 				panic(x)
@@ -775,7 +793,7 @@ func (db *DB) mCompaction() {
 			switch x.(type) {
 			case cAuto:
 				db.memCompaction()
-				x.ack(nil)
+				x.ack(nil) // 表示完成minor compaction
 				x = nil
 			default:
 				panic("leveldb: unknown command")
@@ -786,6 +804,7 @@ func (db *DB) mCompaction() {
 	}
 }
 
+// tCompaction是major compaction, 即l(i) sst -> l(i+1) sst
 func (db *DB) tCompaction() {
 	var (
 		x     cCmd
@@ -793,6 +812,7 @@ func (db *DB) tCompaction() {
 	)
 
 	defer func() {
+		// 错误处理
 		if x := recover(); x != nil {
 			if x != errCompactionTransactExiting {
 				panic(x)
@@ -809,18 +829,19 @@ func (db *DB) tCompaction() {
 	}()
 
 	for {
+		// 首先是判断各层sst是否需要进行compaction
 		if db.tableNeedCompaction() {
 			select {
-			case x = <-db.tcompCmdC:
-			case ch := <-db.tcompPauseC:
-				db.pauseCompaction(ch)
+			case x = <-db.tcompCmdC:     // 读取主动的compaction命令
+			case ch := <-db.tcompPauseC: // 暂停命令
+				db.pauseCompaction(ch)   // 通知已暂停
 				continue
-			case <-db.closeC:
+			case <-db.closeC:// 退出
 				return
 			default:
 			}
 			// Resume write operation as soon as possible.
-			if len(waitQ) > 0 && db.resumeWrite() {
+			if len(waitQ) > 0 && db.resumeWrite() { // 恢复被暂停的compaction
 				for i := range waitQ {
 					waitQ[i].ack(nil)
 					waitQ[i] = nil
@@ -828,6 +849,8 @@ func (db *DB) tCompaction() {
 				waitQ = waitQ[:0]
 			}
 		} else {
+			// compaction已经结束了
+			// 给所有等待compaction结束的ch塞入返回值
 			for i := range waitQ {
 				waitQ[i].ack(nil)
 				waitQ[i] = nil
@@ -844,7 +867,7 @@ func (db *DB) tCompaction() {
 		}
 		if x != nil {
 			switch cmd := x.(type) {
-			case cAuto:
+			case cAuto: // 自动compaction
 				if cmd.ackC != nil {
 					// Check the write pause state before caching it.
 					if db.resumeWrite() {
@@ -853,13 +876,13 @@ func (db *DB) tCompaction() {
 						waitQ = append(waitQ, x)
 					}
 				}
-			case cRange:
+			case cRange: // 给定范围的compaction
 				x.ack(db.tableRangeCompaction(cmd.level, cmd.min, cmd.max))
 			default:
 				panic("leveldb: unknown command")
 			}
 			x = nil
 		}
-		db.tableAutoCompaction()
+		db.tableAutoCompaction() // 实际执行compaction
 	}
 }

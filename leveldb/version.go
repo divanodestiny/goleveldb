@@ -91,7 +91,7 @@ func (v *version) walkOverlapping(aux tFiles, ikey internalKey, f func(level int
 	ukey := ikey.ukey()
 
 	// Aux level.
-	if aux != nil {
+	if aux != nil { // 外部输入的文件作为第一级
 		for _, t := range aux {
 			if t.overlaps(v.s.icmp, ukey, ukey) {
 				if !f(-1, t) {
@@ -106,14 +106,16 @@ func (v *version) walkOverlapping(aux tFiles, ikey internalKey, f func(level int
 	}
 
 	// Walk tables level-by-level.
+	// 从l0开始遍历每一层的文件
 	for level, tables := range v.levels {
 		if len(tables) == 0 {
 			continue
 		}
 
-		if level == 0 {
+		if level == 0 { // 特殊处理l0
 			// Level-0 files may overlap each other. Find all files that
 			// overlap ukey.
+			// l0中存储的kv范围存在交集, 因此需要遍历
 			for _, t := range tables {
 				if t.overlaps(v.s.icmp, ukey, ukey) {
 					if !f(level, t) {
@@ -121,10 +123,11 @@ func (v *version) walkOverlapping(aux tFiles, ikey internalKey, f func(level int
 					}
 				}
 			}
-		} else {
-			if i := tables.searchMax(v.s.icmp, ikey); i < len(tables) {
+		} else { // 其他
+			// 其他层级中最多只可能存在于一个文件中
+			if i := tables.searchMax(v.s.icmp, ikey); i < len(tables) { // 在该层sst中尝试找到key归属的sst, 大于时说明都没有
 				t := tables[i]
-				if v.s.icmp.uCompare(ukey, t.imin.ukey()) >= 0 {
+				if v.s.icmp.uCompare(ukey, t.imin.ukey()) >= 0 { // 比较user key
 					if !f(level, t) {
 						return
 					}
@@ -132,7 +135,7 @@ func (v *version) walkOverlapping(aux tFiles, ikey internalKey, f func(level int
 			}
 		}
 
-		if lf != nil && !lf(level) {
+		if lf != nil && !lf(level) { // 一层遍历完了发现没有则调用lf
 			return
 		}
 	}
@@ -161,8 +164,14 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 
 	// Since entries never hop across level, finding key/value
 	// in smaller level make later levels irrelevant.
+	// 首先检查aux输入的sst列表中是否包含目标key
+	// 然后从l0开始检查
 	v.walkOverlapping(aux, ikey, func(level int, t *tFile) bool {
+
+		// level是找到目标所在的层级
+		// t是包含目标key的sst
 		if sampleSeeks && level >= 0 && !tseek {
+			// tSet包含了范围包含了目标key的sst
 			if tset == nil {
 				tset = &tSet{level, t}
 			} else {
@@ -174,13 +183,13 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 			fikey, fval []byte
 			ferr        error
 		)
-		if noValue {
+		if noValue { // 检查需不需要返回值
 			fikey, ferr = v.s.tops.findKey(t, ikey, ro)
 		} else {
 			fikey, fval, ferr = v.s.tops.find(t, ikey, ro)
 		}
 
-		switch ferr {
+		switch ferr { // 错误处理
 		case nil:
 		case ErrNotFound:
 			return true
@@ -192,8 +201,8 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 		if fukey, fseq, fkt, fkerr := parseInternalKey(fikey); fkerr == nil {
 			if v.s.icmp.uCompare(ukey, fukey) == 0 {
 				// Level <= 0 may overlaps each-other.
-				if level <= 0 {
-					if fseq >= zseq {
+				if level <= 0 { // l0需要遍历, 要找到seq最大的那一个
+					if fseq >= zseq {  // 本质上这里应该也可以优化? 其实因该是可以从seq最大的那个l0文件遍历然后退出?
 						zfound = true
 						zseq = fseq
 						zkt = fkt
@@ -218,7 +227,7 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 
 		return true
 	}, func(level int) bool {
-		if zfound {
+		if zfound { // 如果在第0层找到了
 			switch zkt {
 			case keyTypeVal:
 				value = zval
@@ -234,6 +243,7 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 	})
 
 	if tseek && tset.table.consumeSeek() <= 0 {
+		// 找到了目标, 但是没有在第一个sst符合范围的sst中找到目标, 也就是第一sst mismatch了就会触发compaction
 		tcomp = atomic.CompareAndSwapPointer(&v.cSeek, nil, unsafe.Pointer(tset))
 	}
 
@@ -354,6 +364,7 @@ func (v *version) pickMemdbLevel(umin, umax []byte, maxLevel int) (level int) {
 
 func (v *version) computeCompaction() {
 	// Precomputed best level for next compaction
+	// 计算compaction位置, 一般来说会在发生mem compaction是进行计算
 	bestLevel := int(-1)
 	bestScore := float64(-1)
 
@@ -377,8 +388,10 @@ func (v *version) computeCompaction() {
 			// file size is small (perhaps because of a small write-buffer
 			// setting, or very high compression ratios, or lots of
 			// overwrites/deletions).
+			// l0层是根据文件数量进行计分
 			score = float64(len(tables)) / float64(v.s.o.GetCompactionL0Trigger())
 		} else {
+			// 其他层是根据文件总大小进行计分
 			score = float64(size) / float64(v.s.o.GetCompactionTotalSize(level))
 		}
 
@@ -393,6 +406,7 @@ func (v *version) computeCompaction() {
 		statTotSize += size
 	}
 
+	// 选择计分最大的那一层预备进行下一次compaction
 	v.cLevel = bestLevel
 	v.cScore = bestScore
 

@@ -14,6 +14,7 @@ func bloomHash(key []byte) uint32 {
 	return util.Hash(key, 0xbc9f1d34)
 }
 
+// 布隆过滤器
 type bloomFilter int
 
 // Name: The bloom filter serializes its parameters and is backward compatible
@@ -25,7 +26,7 @@ func (bloomFilter) Name() string {
 
 func (f bloomFilter) Contains(filter, key []byte) bool {
 	nBytes := len(filter) - 1
-	if nBytes < 1 {
+	if nBytes < 1 { // 判空
 		return false
 	}
 	nBits := uint32(nBytes * 8)
@@ -34,6 +35,7 @@ func (f bloomFilter) Contains(filter, key []byte) bool {
 	// bloom filters created using different parameters.
 	k := filter[nBytes]
 	if k > 30 {
+		// 最后一位
 		// Reserved for potentially new encodings for short bloom filters.
 		// Consider it a match.
 		return true
@@ -41,6 +43,7 @@ func (f bloomFilter) Contains(filter, key []byte) bool {
 
 	kh := bloomHash(key)
 	delta := (kh >> 17) | (kh << 15) // Rotate right 17 bits
+	// 按照写入时的方式进行旋转与检查
 	for j := uint8(0); j < k; j++ {
 		bitpos := kh % nBits
 		if (uint32(filter[bitpos/8]) & (1 << (bitpos % 8))) == 0 {
@@ -53,10 +56,15 @@ func (f bloomFilter) Contains(filter, key []byte) bool {
 
 func (f bloomFilter) NewGenerator() FilterGenerator {
 	// Round down to reduce probing cost a little bit.
+	//
+	// http://blog.csdn.net/jiaomeng/article/details/1495500
+	// k表示哈希函数个数
+	// f表示容量m除以插入数据量n?
+	// k = ln2 * f 时布隆过滤器有最优准确率
 	k := uint8(f * 69 / 100) // 0.69 =~ ln(2)
 	if k < 1 {
 		k = 1
-	} else if k > 30 {
+	} else if k > 30 { // hash函数太多了就性能就比较差, 这里做了一个trade off将最大值限制到30
 		k = 30
 	}
 	return &bloomFilterGenerator{
@@ -72,14 +80,17 @@ type bloomFilterGenerator struct {
 	keyHashes []uint32
 }
 
+// 添加时简单将hash存储在整数切片中
 func (g *bloomFilterGenerator) Add(key []byte) {
 	// Use double-hashing to generate a sequence of hash values.
 	// See analysis in [Kirsch,Mitzenmacher 2006].
 	g.keyHashes = append(g.keyHashes, bloomHash(key))
 }
 
+// 构建数组到buffer中
 func (g *bloomFilterGenerator) Generate(b Buffer) {
 	// Compute bloom filter size (in both bits and bytes)
+	// g.n实际上是容量m除以插入数据量n, g.keyHashs是数据量, nBits求出来是理想的容量
 	nBits := uint32(len(g.keyHashes) * g.n)
 	// For small n, we can see a very high false positive rate.  Fix it
 	// by enforcing a minimum bloom filter length.
@@ -90,11 +101,15 @@ func (g *bloomFilterGenerator) Generate(b Buffer) {
 	nBits = nBytes * 8
 
 	dest := b.Alloc(int(nBytes) + 1)
-	dest[nBytes] = g.k
+	dest[nBytes] = g.k // 末尾记录hash函数个数k
 	for _, kh := range g.keyHashes {
+		// kh
 		delta := (kh >> 17) | (kh << 15) // Rotate right 17 bits
+		// 将高17位移动到低17位, 低15位移到高15位
+		// bit[0:14]  => bit[17:32]
+		// bit[15:32] => bit[0:17]
 		for j := uint8(0); j < g.k; j++ {
-			bitpos := kh % nBits
+			bitpos := kh % nBits // 这里是定了一个hash计算的规则
 			dest[bitpos/8] |= (1 << (bitpos % 8))
 			kh += delta
 		}

@@ -411,6 +411,7 @@ func (t *tOps) createFrom(src iterator.Iterator) (f *tFile, n int, err error) {
 
 // Opens table. It returns a cache handle, which should
 // be released after use.
+// 从lru cache中获取文件缓存, 如果缓存中没有的话就打开文件以获取缓存
 func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 	ch = t.cache.Get(0, uint64(f.fd.Num), func() (size int, value cache.Value) {
 		var r storage.Reader
@@ -424,7 +425,7 @@ func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 			bcache = &cache.NamespaceGetter{Cache: t.bcache, NS: uint64(f.fd.Num)}
 		}
 
-		var tr *table.Reader
+		var tr *table.Reader // 构建一个sst读取器, 改读取器会被放到lru cache里面
 		tr, err = table.NewReader(r, f.size, f.fd, bcache, t.bpool, t.s.o.Options)
 		if err != nil {
 			r.Close()

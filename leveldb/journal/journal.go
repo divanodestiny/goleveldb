@@ -11,18 +11,30 @@
 // Package journal reads and writes sequences of journals. Each journal is a stream
 // of bytes that completes before the next journal starts.
 //
+// 日志包用来以顺序的方式读写日志, 每一个日志是是一个字节流, 在下一个日志开始前终结(通过header中的长度来判断终结位置)
+//
 // When reading, call Next to obtain an io.Reader for the next journal. Next will
 // return io.EOF when there are no more journals. It is valid to call Next
 // without reading the current journal to exhaustion.
 //
+// 当读日志时, 调用Next函数以获取下一个日志对应的io.Reader接口. 当没有更多日志时Next将返回io.EOF.
+// 当当前日志没有读取完时, 调用Next函数也是有效的.
+//
 // When writing, call Next to obtain an io.Writer for the next journal. Calling
 // Next finishes the current journal. Call Close to finish the final journal.
+//
+// 当写入时, 调用Next函数获取下一个日志的io.Writer接口. 调用Next将终止当前日志的写入
+// 调用Close将结束追后的日志
 //
 // Optionally, call Flush to finish the current journal and flush the underlying
 // writer without starting a new journal. To start a new journal after flushing,
 // call Next.
 //
+// 可选: 调用Flush结束当前日志并且将所有还没有刷盘的日志刷入磁盘. 在刷盘后调用Next开启一个新的日志
+//
 // Neither Readers or Writers are safe to use concurrently.
+//
+// Reader和Writer都不是并发安全的
 //
 // Example code:
 //	func read(r io.Reader) ([]string, error) {
@@ -89,15 +101,31 @@ import (
 
 // These constants are part of the wire format and should not be changed.
 const (
-	fullChunkType   = 1
-	firstChunkType  = 2
-	middleChunkType = 3
-	lastChunkType   = 4
+	fullChunkType   = 1  // 全日志, 表示所有日志都在一个block里面
+	firstChunkType  = 2  // 非全日志起始, 表示数据量过大的无法装入当前block的日志起始日志
+	middleChunkType = 3  // 非全日志中继, 表示数据量过大的无法装入当前block的日志中间日志
+	lastChunkType   = 4  // 非全日志结尾, 表示数据量过大的无法装入当前block的日志结尾日志
 )
 
+// 为了增加读取效率, 日志文件按照block进行划分, 每个block大小为32KB, 每个block包含若干完整的chunk, chunk类型如上所示
+// 由于一个block的大小为32KiB，因此
+// 当一条日志过大时, 做如下操作:
+// 1. 会将第一部分数据写在第一个block中，且类型为first，
+// 2. 若剩余的数据仍然超过一个block的大小，则第二部分数据写在第二个block中，类型为middle，不断循环处理
+// 3. 最后剩余不到一个block的大小数据写在最后一个block中，类型为last
+// 日志文件格式
+//  block0   log0    | CheckSum | Length | FullType   | Data |
+//           log1    | CheckSum | Length | FirstType  | Data |
+//  -----------------------------------------------------------
+//  block1   log1    | CheckSum | Length | LastType   | Data |
+//           log2    | CheckSum | Length | FirstType  | Data |
+//  -----------------------------------------------------------
+//  block2   log2    | CheckSum | Length | MiddleType | Data |
+//  -----------------------------------------------------------
+//  block3   log2    | CheckSum | Length | LastType   | Data |
 const (
-	blockSize  = 32 * 1024
-	headerSize = 7
+	blockSize  = 32 * 1024 // 一个日志块大小
+	headerSize = 7         // 日志头部大小
 )
 
 type flusher interface {
@@ -161,6 +189,7 @@ func NewReader(r io.Reader, dropper Dropper, strict, checksum bool) *Reader {
 
 var errSkip = errors.New("leveldb/journal: skipped")
 
+// 报错方法
 func (r *Reader) corrupt(n int, reason string, skip bool) error {
 	if r.dropper != nil {
 		r.dropper.Drop(&ErrCorrupted{n, reason})
@@ -172,22 +201,26 @@ func (r *Reader) corrupt(n int, reason string, skip bool) error {
 	return errSkip
 }
 
+// chunk格式
+// | CheckSum | Length | FullType   | Data |
+// 一条日志的具体格式
+// | sequence number | entry number | batch data | ... | batch data |
 // nextChunk sets r.buf[r.i:r.j] to hold the next chunk's payload, reading the
 // next block into the buffer if necessary.
 func (r *Reader) nextChunk(first bool) error {
 	for {
-		if r.j+headerSize <= r.n {
-			checksum := binary.LittleEndian.Uint32(r.buf[r.j+0 : r.j+4])
-			length := binary.LittleEndian.Uint16(r.buf[r.j+4 : r.j+6])
-			chunkType := r.buf[r.j+6]
-			unprocBlock := r.n - r.j
-			if checksum == 0 && length == 0 && chunkType == 0 {
+		if r.j+headerSize <= r.n { // block剩余内容可以存放有效内容
+			checksum := binary.LittleEndian.Uint32(r.buf[r.j+0 : r.j+4]) // 校验和
+			length := binary.LittleEndian.Uint16(r.buf[r.j+4 : r.j+6])   // 长度
+			chunkType := r.buf[r.j+6] // 类型
+			unprocBlock := r.n - r.j // 未处理部分
+			if checksum == 0 && length == 0 && chunkType == 0 { // chunk
 				// Drop entire block.
 				r.i = r.n
 				r.j = r.n
 				return r.corrupt(unprocBlock, "zero header", false)
 			}
-			if chunkType < fullChunkType || chunkType > lastChunkType {
+			if chunkType < fullChunkType || chunkType > lastChunkType { // 无效类型
 				// Drop entire block.
 				r.i = r.n
 				r.j = r.n
@@ -195,28 +228,30 @@ func (r *Reader) nextChunk(first bool) error {
 			}
 			r.i = r.j + headerSize
 			r.j = r.j + headerSize + int(length)
-			if r.j > r.n {
+			if r.j > r.n { // 不完整
 				// Drop entire block.
 				r.i = r.n
 				r.j = r.n
 				return r.corrupt(unprocBlock, "chunk length overflows block", false)
-			} else if r.checksum && checksum != util.NewCRC(r.buf[r.i-1:r.j]).Value() {
+			} else if r.checksum && checksum != util.NewCRC(r.buf[r.i-1:r.j]).Value() { // 校验和不对
 				// Drop entire block.
 				r.i = r.n
 				r.j = r.n
 				return r.corrupt(unprocBlock, "checksum mismatch", false)
 			}
-			if first && chunkType != fullChunkType && chunkType != firstChunkType {
+			if first && chunkType != fullChunkType && chunkType != firstChunkType { // 类型错误, first置为true时, 必须是full或者first
 				chunkLength := (r.j - r.i) + headerSize
 				r.i = r.j
 				// Report the error, but skip it.
 				return r.corrupt(chunkLength, "orphan chunk", true)
 			}
-			r.last = chunkType == fullChunkType || chunkType == lastChunkType
+			r.last = chunkType == fullChunkType || chunkType == lastChunkType // 当前块是终结块
 			return nil
 		}
 
+		// 更换block
 		// The last block.
+		// 当前block没有被填满, 意味着这是最后一个block, 没有下一个块了
 		if r.n < blockSize && r.n > 0 {
 			if !first {
 				return r.corrupt(0, "missing chunk part", false)
@@ -226,6 +261,7 @@ func (r *Reader) nextChunk(first bool) error {
 		}
 
 		// Read block.
+		// 将新块读入内存
 		n, err := io.ReadFull(r.r, r.buf[:])
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			return err
@@ -245,6 +281,7 @@ func (r *Reader) nextChunk(first bool) error {
 // more journals. The reader returned becomes stale after the next Next call,
 // and should no longer be used. If strict is false, the reader will returns
 // io.ErrUnexpectedEOF error when found corrupted journal.
+// 返回可以读取下一个journal的reader
 func (r *Reader) Next() (io.Reader, error) {
 	r.seq++
 	if r.err != nil {
@@ -252,6 +289,9 @@ func (r *Reader) Next() (io.Reader, error) {
 	}
 	r.i = r.j
 	for {
+		// 获取了下一个chunk
+		// 这里都是获取当前seq对应的第一个chunk, fullType或者firstType
+		// 可能有的后续的chunk使用singleReader进行读取
 		if err := r.nextChunk(true); err == nil {
 			break
 		} else if err != errSkip {
@@ -263,6 +303,7 @@ func (r *Reader) Next() (io.Reader, error) {
 
 // Reset resets the journal reader, allows reuse of the journal reader. Reset returns
 // last accumulated error.
+// 重置
 func (r *Reader) Reset(reader io.Reader, dropper Dropper, strict, checksum bool) error {
 	r.seq++
 	err := r.err
@@ -284,6 +325,7 @@ type singleReader struct {
 	err error
 }
 
+// 读取
 func (x *singleReader) Read(p []byte) (int, error) {
 	r := x.r
 	if r.seq != x.seq {
@@ -295,7 +337,7 @@ func (x *singleReader) Read(p []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
 	}
-	for r.i == r.j {
+	for r.i == r.j { // 此时意味着当前chunk读取完, 如果不是fullType或者lastType, 那么更换到下一个chunk
 		if r.last {
 			return 0, io.EOF
 		}
@@ -312,6 +354,7 @@ func (x *singleReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// 只读取一个byte, 逻辑和上面基本一致
 func (x *singleReader) ReadByte() (byte, error) {
 	r := x.r
 	if r.seq != x.seq {
@@ -374,11 +417,14 @@ func NewWriter(w io.Writer) *Writer {
 }
 
 // fillHeader fills in the header for the pending chunk.
+// 填充头部
+// chunk格式
+// | CheckSum | Length | FullType   | Data |
 func (w *Writer) fillHeader(last bool) {
 	if w.i+headerSize > w.j || w.j > blockSize {
 		panic("leveldb/journal: bad writer state")
 	}
-	if last {
+	if last { // 计算类型, 存入第七个byte
 		if w.first {
 			w.buf[w.i+6] = fullChunkType
 		} else {
@@ -391,12 +437,13 @@ func (w *Writer) fillHeader(last bool) {
 			w.buf[w.i+6] = middleChunkType
 		}
 	}
-	binary.LittleEndian.PutUint32(w.buf[w.i+0:w.i+4], util.NewCRC(w.buf[w.i+6:w.j]).Value())
-	binary.LittleEndian.PutUint16(w.buf[w.i+4:w.i+6], uint16(w.j-w.i-headerSize))
+	binary.LittleEndian.PutUint32(w.buf[w.i+0:w.i+4], util.NewCRC(w.buf[w.i+6:w.j]).Value()) // 4bytes存入uint32 crc校验和
+	binary.LittleEndian.PutUint16(w.buf[w.i+4:w.i+6], uint16(w.j-w.i-headerSize))            // 2bytes存入uint16 日志长度
 }
 
 // writeBlock writes the buffered block to the underlying writer, and reserves
 // space for the next chunk's header.
+// 写块
 func (w *Writer) writeBlock() {
 	_, w.err = w.w.Write(w.buf[w.written:])
 	w.i = 0
@@ -406,11 +453,13 @@ func (w *Writer) writeBlock() {
 
 // writePending finishes the current journal and writes the buffer to the
 // underlying writer.
+// 完成当前journal并且写入底层writer
 func (w *Writer) writePending() {
 	if w.err != nil {
 		return
 	}
 	if w.pending {
+		// 终结chunk
 		w.fillHeader(true)
 		w.pending = false
 	}
@@ -419,6 +468,7 @@ func (w *Writer) writePending() {
 }
 
 // Close finishes the current journal and closes the writer.
+// 关闭当前journal并且退出
 func (w *Writer) Close() error {
 	w.seq++
 	w.writePending()
@@ -431,6 +481,7 @@ func (w *Writer) Close() error {
 
 // Flush finishes the current journal, writes to the underlying writer, and
 // flushes it if that writer implements interface{ Flush() error }.
+// 将当前journal刷盘
 func (w *Writer) Flush() error {
 	w.seq++
 	w.writePending()
@@ -438,6 +489,7 @@ func (w *Writer) Flush() error {
 		return w.err
 	}
 	if w.f != nil {
+		// 区别就是这里会刷盘
 		w.err = w.f.Flush()
 		return w.err
 	}
@@ -446,6 +498,7 @@ func (w *Writer) Flush() error {
 
 // Reset resets the journal writer, allows reuse of the journal writer. Reset
 // will also closes the journal writer if not already.
+// 重置
 func (w *Writer) Reset(writer io.Writer) (err error) {
 	w.seq++
 	if w.err == nil {
@@ -465,6 +518,7 @@ func (w *Writer) Reset(writer io.Writer) (err error) {
 
 // Next returns a writer for the next journal. The writer returned becomes stale
 // after the next Close, Flush or Next call, and should no longer be used.
+// 返回下一个journal的writer,
 func (w *Writer) Next() (io.Writer, error) {
 	w.seq++
 	if w.err != nil {
@@ -475,17 +529,22 @@ func (w *Writer) Next() (io.Writer, error) {
 	}
 	w.i = w.j
 	w.j = w.j + headerSize
+
 	// Check if there is room in the block for the header.
+	// 看是不是还有空间可以写, 如果没有的话需要
 	if w.j > blockSize {
 		// Fill in the rest of the block with zeroes.
+		//
 		for k := w.i; k < blockSize; k++ {
 			w.buf[k] = 0
 		}
+		// 当前buf没办法再写下一个日志了, 就写当前块
 		w.writeBlock()
 		if w.err != nil {
 			return nil, w.err
 		}
 	}
+	// 当前block没有写满, 那么还是buf状态, 还可以接受下一个写入
 	w.first = true
 	w.pending = true
 	return singleWriter{w, w.seq}, nil
@@ -507,8 +566,9 @@ func (x singleWriter) Write(p []byte) (int, error) {
 	n0 := len(p)
 	for len(p) > 0 {
 		// Write a block, if it is full.
+		// 如果写满了buffer, 就正式写block(32KB)
 		if w.j == blockSize {
-			w.fillHeader(false)
+			w.fillHeader(false) // 注意这里更新了header
 			w.writeBlock()
 			if w.err != nil {
 				return 0, w.err

@@ -18,7 +18,7 @@ type FileType int
 
 // File types.
 const (
-	TypeManifest FileType = 1 << iota
+	TypeManifest FileType = 1 << iota  //
 	TypeJournal
 	TypeTable
 	TypeTemp

@@ -29,19 +29,21 @@ func (db *DB) acquireSnapshot() *snapshotElement {
 	db.snapsMu.Lock()
 	defer db.snapsMu.Unlock()
 
-	seq := db.getSeq()
+	seq := db.getSeq() // 获取一个新的访问序号, 用来做MVCC用
+	// 只是一直读的话是不会更新seq的, 写入的时候seq会自增
 
 	if e := db.snapsList.Back(); e != nil {
+		// 获取最后一个快照
 		se := e.Value.(*snapshotElement)
 		if se.seq == seq {
-			se.ref++
+			se.ref++ // 增加最后一个快照的引用数
 			return se
 		} else if seq < se.seq {
 			panic("leveldb: sequence number is not increasing")
 		}
 	}
 	se := &snapshotElement{seq: seq, ref: 1}
-	se.e = db.snapsList.PushBack(se)
+	se.e = db.snapsList.PushBack(se) // 链表尾部放入快照信息
 	return se
 }
 
@@ -50,7 +52,7 @@ func (db *DB) releaseSnapshot(se *snapshotElement) {
 	db.snapsMu.Lock()
 	defer db.snapsMu.Unlock()
 
-	se.ref--
+	se.ref-- // 当引用数清空时, 会从链表中移除快照
 	if se.ref == 0 {
 		db.snapsList.Remove(se.e)
 		se.e = nil

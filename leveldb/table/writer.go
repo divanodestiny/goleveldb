@@ -20,6 +20,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
+// 计算重启点共享前缀长度
 func sharedPrefixLen(a, b []byte) int {
 	i, n := 0, len(a)
 	if n > len(b) {
@@ -40,6 +41,7 @@ type blockWriter struct {
 	scratch         []byte
 }
 
+// 往块里面写入kv
 func (w *blockWriter) append(key, value []byte) {
 	nShared := 0
 	if w.nEntries%w.restartInterval == 0 {
@@ -57,6 +59,7 @@ func (w *blockWriter) append(key, value []byte) {
 	w.nEntries++
 }
 
+// 完成写入, 并且在末尾补上重启点信息
 func (w *blockWriter) finish() {
 	// Write restarts entry.
 	if w.nEntries == 0 {
@@ -76,6 +79,7 @@ func (w *blockWriter) reset() {
 	w.restarts = w.restarts[:0]
 }
 
+// 数据长度加上重启点长度
 func (w *blockWriter) bytesLen() int {
 	restartsLen := len(w.restarts)
 	if restartsLen == 0 {
@@ -163,6 +167,7 @@ type Writer struct {
 func (w *Writer) writeBlock(buf *util.Buffer, compression opt.Compression) (bh blockHandle, err error) {
 	// Compress the buffer if necessary.
 	var b []byte
+	// 压缩选项
 	if compression == opt.SnappyCompression {
 		// Allocate scratch enough for compression and block trailer.
 		if n := snappy.MaxEncodedLen(buf.Len()) + blockTrailerLen; len(w.compressionScratch) < n {
@@ -179,11 +184,13 @@ func (w *Writer) writeBlock(buf *util.Buffer, compression opt.Compression) (bh b
 	}
 
 	// Calculate the checksum.
+	// 计算校验和
 	n := len(b) - 4
 	checksum := util.NewCRC(b[:n]).Value()
 	binary.LittleEndian.PutUint32(b[n:], checksum)
 
 	// Write the buffer to the file.
+	// 写入到底层writer
 	_, err = w.writer.Write(b)
 	if err != nil {
 		return
@@ -193,6 +200,7 @@ func (w *Writer) writeBlock(buf *util.Buffer, compression opt.Compression) (bh b
 	return
 }
 
+// 这里主要是根据上一个block和即将生成的新block的信息, 在index block中更新索引
 func (w *Writer) flushPendingBH(key []byte) {
 	if w.pendingBH.length == 0 {
 		return
@@ -214,7 +222,7 @@ func (w *Writer) flushPendingBH(key []byte) {
 	// Reset prev key of the data block.
 	w.dataBlock.prevKey = w.dataBlock.prevKey[:0]
 	// Clear pending block handle.
-	w.pendingBH = blockHandle{}
+	w.pendingBH = blockHandle{} // 清除了以后表示索引已经更新, 在204行就会短路退出了, 直到当前block完成之后才会继续flushPendingBH
 }
 
 func (w *Writer) finishBlock() error {
@@ -235,6 +243,7 @@ func (w *Writer) finishBlock() error {
 // be in increasing order.
 //
 // It is safe to modify the contents of the arguments after Append returns.
+// 追加写入kv
 func (w *Writer) Append(key, value []byte) error {
 	if w.err != nil {
 		return w.err
@@ -244,6 +253,8 @@ func (w *Writer) Append(key, value []byte) error {
 		return w.err
 	}
 
+	// 如果有等待的block数据就会刷入, 并更新index block
+	// 当前一个block结束后, 会生成新一个block的句柄,
 	w.flushPendingBH(key)
 	// Append key/value pair to the data block.
 	w.dataBlock.append(key, value)
@@ -252,7 +263,7 @@ func (w *Writer) Append(key, value []byte) error {
 
 	// Finish the data block if block size target reached.
 	if w.dataBlock.bytesLen() >= w.blockSize {
-		if err := w.finishBlock(); err != nil {
+		if err := w.finishBlock(); err != nil { // 这里生成等待的block
 			w.err = err
 			return w.err
 		}
@@ -291,6 +302,7 @@ func (w *Writer) Close() error {
 
 	// Write the last data block. Or empty data block if there
 	// aren't any data blocks at all.
+	// 写入最后一个数据块
 	if w.dataBlock.nEntries > 0 || w.nEntries == 0 {
 		if err := w.finishBlock(); err != nil {
 			w.err = err
@@ -300,6 +312,7 @@ func (w *Writer) Close() error {
 	w.flushPendingBH(nil)
 
 	// Write the filter block.
+	// 写入过滤器
 	var filterBH blockHandle
 	w.filterBlock.finish()
 	if buf := &w.filterBlock.buf; buf.Len() > 0 {
@@ -310,6 +323,7 @@ func (w *Writer) Close() error {
 	}
 
 	// Write the metaindex block.
+	// 写元索引块, 主要是写入filter相关信息, 这里就是写入布隆过滤器
 	if filterBH.length > 0 {
 		key := []byte("filter." + w.filter.Name())
 		n := encodeBlockHandle(w.scratch[:20], filterBH)
@@ -323,6 +337,7 @@ func (w *Writer) Close() error {
 	}
 
 	// Write the index block.
+	// 写索引块
 	w.indexBlock.finish()
 	indexBH, err := w.writeBlock(&w.indexBlock.buf, w.compression)
 	if err != nil {
@@ -331,6 +346,7 @@ func (w *Writer) Close() error {
 	}
 
 	// Write the table footer.
+	// 更新页脚
 	footer := w.scratch[:footerLen]
 	for i := range footer {
 		footer[i] = 0

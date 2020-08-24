@@ -10,14 +10,17 @@ import "bytes"
 
 type bytesComparer struct{}
 
+// 字节比较
 func (bytesComparer) Compare(a, b []byte) int {
 	return bytes.Compare(a, b)
 }
 
+// 名称
 func (bytesComparer) Name() string {
 	return "leveldb.BytewiseComparator"
 }
 
+// 找到ab之间的最短的分隔符x, 满足 x <= a && x > b
 func (bytesComparer) Separator(dst, a, b []byte) []byte {
 	i, n := 0, len(a)
 	if n > len(b) {
@@ -35,6 +38,7 @@ func (bytesComparer) Separator(dst, a, b []byte) []byte {
 	return nil
 }
 
+// 找到最短的终止符x, 满足x>=b
 func (bytesComparer) Successor(dst, b []byte) []byte {
 	for i, c := range b {
 		if c != 0xff {

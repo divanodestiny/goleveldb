@@ -739,36 +739,54 @@ func (db *DB) recoverJournalRO() error {
 	return nil
 }
 
+// ok表示找到没找到, mv表示跳表中的值
 func memGet(mdb *memdb.DB, ikey internalKey, icmp *iComparer) (ok bool, mv []byte, err error) {
+	// 跳表中寻找到内部key
 	mk, mv, err := mdb.Find(ikey)
 	if err == nil {
+		// 返回的mk是一个大于等于ikey的值
+		// 将internal key拆分出user key
 		ukey, _, kt, kerr := parseInternalKey(mk)
 		if kerr != nil {
 			// Shouldn't have had happen.
 			panic(kerr)
 		}
-		if icmp.uCompare(ukey, ikey.ukey()) == 0 {
-			if kt == keyTypeDel {
+		if icmp.uCompare(ukey, ikey.ukey()) == 0 { // 比较user key与预期是否相等
+			if kt == keyTypeDel { // 如果是del的话, 那意味着被删掉了
 				return true, nil, ErrNotFound
 			}
-			return true, mv, nil
+			return true, mv, nil // 存在对应值
 
 		}
 	} else if err != ErrNotFound {
+		// 错误处理, 这个地方错误处理应该有问题
+		// 理论上应该是ok应该是false
+		// 但是现在不会抛出ErrNotFound以外的err, 所以现在应该是work的
 		return true, nil, err
 	}
+	// 没找到
+	// false, nil, ErrNotFound
 	return
 }
 
+// leveldb的读取分成几个步骤
+// 1. 从aux mem db中读取
+// 2. 从mutable mem db中读取
+// 3. 从immutable mem db中读取
+// 4. 从sst中读取
 func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, err error) {
+	// 构建internal key
+	// internal key由user key + seq + type 得到, type只有两个值, 值类型和删除类型, 这里seek实际上是值类型
 	ikey := makeInternalKey(nil, key, seq, keyTypeSeek)
 
+	// 先从跳表中尝试获取传入的mem table中获取
 	if auxm != nil {
 		if ok, mv, me := memGet(auxm, ikey, db.s.icmp); ok {
 			return append([]byte{}, mv...), me
 		}
 	}
 
+	// 当前db里面的mutable mem table 和immutable mem table
 	em, fm := db.getMems()
 	for _, m := range [...]*memDB{em, fm} {
 		if m == nil {
@@ -781,11 +799,13 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		}
 	}
 
+	// 从文件中获取数据
 	v := db.s.version()
 	value, cSched, err := v.get(auxt, ikey, ro, false)
 	v.release()
 	if cSched {
 		// Trigger table compaction.
+		// 触发异步的compaction
 		db.compTrigger(db.tcompCmdC)
 	}
 	return
@@ -848,6 +868,11 @@ func (db *DB) Get(key []byte, ro *opt.ReadOptions) (value []byte, err error) {
 
 	se := db.acquireSnapshot()
 	defer db.releaseSnapshot(se)
+	// 快照读
+	// 快照本质上是一个seq序号
+	// leveldb中用户对于一个key的增删改会产生多条数据项
+	// 当且仅当compaction时被合并的sst才会将里面的多条记录融合成一条记录
+	// 序号越大说明值越新, 更改地越晚
 	return db.get(nil, nil, key, se.seq, ro)
 }
 

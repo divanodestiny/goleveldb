@@ -62,14 +62,18 @@ type block struct {
 }
 
 func (b *block) seek(cmp comparer.Comparer, rstart, rlimit int, key []byte) (index, offset int, err error) {
+	// 使用二分搜索来寻找key在的index
 	index = sort.Search(b.restartsLen-rstart-(b.restartsLen-rlimit), func(i int) bool {
-		offset := int(binary.LittleEndian.Uint32(b.data[b.restartsOffset+4*(rstart+i):]))
+		// 一个数据项的格式
+		// | 共享key长度 | 非共享key长度 | 值长度 | 非共享key内容 | 值内容 |
+		// 这里是定位重启点, 共享key长度都是0, 非共享key就是完整的key
+		offset := int(binary.LittleEndian.Uint32(b.data[b.restartsOffset+4*(rstart+i):])) // 与重启点共享的前缀key长度
 		offset++                                    // shared always zero, since this is a restart point
-		v1, n1 := binary.Uvarint(b.data[offset:])   // key length
-		_, n2 := binary.Uvarint(b.data[offset+n1:]) // value length
+		v1, n1 := binary.Uvarint(b.data[offset:])   // key length    key剩余长度
+		_, n2 := binary.Uvarint(b.data[offset+n1:]) // value length  值长度
 		m := offset + n1 + n2
-		return cmp.Compare(b.data[m:m+int(v1)], key) > 0
-	}) + rstart - 1
+		return cmp.Compare(b.data[m:m+int(v1)], key) > 0 // 匹配
+	}) + rstart - 1 // 这里找到的其实是前一个重启点的偏移, 向后寻找才有可能找到目标
 	if index < rstart {
 		// The smallest key is greater-than key sought.
 		index = rstart
@@ -229,6 +233,7 @@ func (i *blockIter) Seek(key []byte) bool {
 		return false
 	}
 
+	// 定位到重启点
 	ri, offset, err := i.block.seek(i.tr.cmp, i.riStart, i.riLimit, key)
 	if err != nil {
 		i.sErr(err)
@@ -236,10 +241,10 @@ func (i *blockIter) Seek(key []byte) bool {
 	}
 	i.restartIndex = ri
 	i.offset = max(i.offsetStart, offset)
-	if i.dir == dirSOI || i.dir == dirEOI {
-		i.dir = dirForward
+	if i.dir == dirSOI || i.dir == dirEOI { // 迭代方向判断, 向下迭代还是向上迭代
+		i.dir = dirForward // 更新状态向下迭代
 	}
-	for i.Next() {
+	for i.Next() { // 从重启点开始, 按照设定的方向进行迭代
 		if i.tr.cmp.Compare(i.key, key) >= 0 {
 			return true
 		}
@@ -248,6 +253,7 @@ func (i *blockIter) Seek(key []byte) bool {
 }
 
 func (i *blockIter) Next() bool {
+	// 迭代器状态错误
 	if i.dir == dirEOI || i.err != nil {
 		return false
 	} else if i.dir == dirReleased {
@@ -255,34 +261,41 @@ func (i *blockIter) Next() bool {
 		return false
 	}
 
-	if i.dir == dirSOI {
+	if i.dir == dirSOI { // 迭代器现在在起始位置
 		i.restartIndex = i.riStart
 		i.offset = i.offsetStart
 	} else if i.dir == dirBackward {
 		i.prevNode = i.prevNode[:0]
 		i.prevKeys = i.prevKeys[:0]
 	}
+
+	// 这里是当前偏移和目标范围有差距
+	// 需要不断滚动到下一个位置, 可能可以进行一些优化, 减少一些不必要的操作
 	for i.offset < i.offsetRealStart {
-		key, value, nShared, n, err := i.block.entry(i.offset)
+		key, value, nShared, n, err := i.block.entry(i.offset) // 读取数据项
 		if err != nil {
 			i.sErr(i.tr.fixErrCorruptedBH(i.block.bh, err))
 			return false
 		}
-		if n == 0 {
+		if n == 0 { // 迭代到末尾了
 			i.dir = dirEOI
 			return false
 		}
+		// 更新key, 由共享key和非共享key拼接成
+		// 注意如果向后迭代的话一定共享部分长度不长与前一个key, 所以下面的append操作不会错
 		i.key = append(i.key[:nShared], key...)
 		i.value = value
 		i.offset += n
 	}
-	if i.offset >= i.offsetLimit {
+
+	if i.offset >= i.offsetLimit { // 超出迭代范围
 		i.dir = dirEOI
 		if i.offset != i.offsetLimit {
 			i.sErr(i.tr.newErrCorruptedBH(i.block.bh, "entries offset not aligned"))
 		}
 		return false
 	}
+	// 从偏移开始读取数据项
 	key, value, nShared, n, err := i.block.entry(i.offset)
 	if err != nil {
 		i.sErr(i.tr.fixErrCorruptedBH(i.block.bh, err))
@@ -292,6 +305,7 @@ func (i *blockIter) Next() bool {
 		i.dir = dirEOI
 		return false
 	}
+	// 更新
 	i.key = append(i.key[:nShared], key...)
 	i.value = value
 	i.prevOffset = i.offset
@@ -616,12 +630,12 @@ func (r *Reader) readBlock(bh blockHandle, verifyChecksum bool) (*block, error) 
 }
 
 func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool) (*block, util.Releaser, error) {
-	if r.cache != nil {
+	if r.cache != nil { // cache是否启用
 		var (
 			err error
 			ch  *cache.Handle
 		)
-		if fillCache {
+		if fillCache { // 从lru cache中获取块
 			ch = r.cache.Get(bh.offset, func() (size int, value cache.Value) {
 				var b *block
 				b, err = r.readBlock(bh, verifyChecksum)
@@ -633,7 +647,7 @@ func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool)
 		} else {
 			ch = r.cache.Get(bh.offset, nil)
 		}
-		if ch != nil {
+		if ch != nil { // 最终获取块并且返回
 			b, ok := ch.Value().(*block)
 			if !ok {
 				ch.Release()
@@ -736,18 +750,27 @@ func (r *Reader) newBlockIter(b *block, bReleaser util.Releaser, slice *util.Ran
 		offsetLimit:     b.restartsOffset,
 	}
 	if slice != nil {
+		// 定位迭代范围
 		if slice.Start != nil {
-			if bi.Seek(slice.Start) {
+			// 找到起始范围
+			if bi.Seek(slice.Start) { // 找到了起始位置, 设置上边界
 				bi.riStart = b.restartIndex(bi.restartIndex, b.restartsLen, bi.prevOffset)
 				bi.offsetStart = b.restartOffset(bi.riStart)
 				bi.offsetRealStart = bi.prevOffset
-			} else {
+			} else { // 没找到起始位置, 那么从当前block数据段末尾开始, 也就是从重启点开始
 				bi.riStart = b.restartsLen
 				bi.offsetStart = b.restartsOffset
 				bi.offsetRealStart = b.restartsOffset
 			}
 		}
 		if slice.Limit != nil {
+			// 找到终止范围
+			// !!!!!!!!!后面两个条件挺有意思的!!!!!!!!!
+			// inclLimit应该标识终止位置能不能被访问
+			// 1. 如果不能被访问, 那么就只能到前一个位置;
+			// 2. 如果可以被访问, 那么就利用Next将迭代器往下在移动一次, 那么prevOffset指向边界位置
+			// 3. 如果可以被访问, 且返回Next是false, 那么在这个block iter中就不存在下边界了, 可以让其遍历到块末尾
+			// 本质上是利用短路来决定是不是再向下移动一个位置
 			if bi.Seek(slice.Limit) && (!inclLimit || bi.Next()) {
 				bi.offsetLimit = bi.prevOffset
 				bi.riLimit = bi.restartIndex + 1
@@ -825,16 +848,19 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 		err = r.err
 		return
 	}
-
+	// 先取得索引块
+	// 获取的顺序是mem -> lru cache -> sst
 	indexBlock, rel, err := r.getIndexBlock(true)
 	if err != nil {
 		return
 	}
 	defer rel.Release()
 
+	// 获取索引块的迭代器
 	index := r.newBlockIter(indexBlock, nil, nil, true)
 	defer index.Release()
 
+	// 在索引块中寻找指定key, 本质上是从重启点开始, 不断next
 	if !index.Seek(key) {
 		if err = index.Error(); err == nil {
 			err = ErrNotFound
@@ -842,6 +868,7 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 		return
 	}
 
+	// 获取到数据块句柄
 	dataBH, n := decodeBlockHandle(index.Value())
 	if n == 0 {
 		r.err = r.newErrCorruptedBH(r.indexBH, "bad data block handle")
@@ -849,10 +876,12 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 	}
 
 	// The filter should only used for exact match.
-	if filtered && r.filter != nil {
-		filterBlock, frel, ferr := r.getFilterBlock(true)
+	if filtered && r.filter != nil { // 如果有过滤器的话就进这里检查
+		filterBlock, frel, ferr := r.getFilterBlock(true) // 获取数据块
 		if ferr == nil {
-			if !filterBlock.contains(r.filter, dataBH.offset, key) {
+			if !filterBlock.contains(r.filter, dataBH.offset, key) { // 使用布隆过滤器验证数据块有没有包含指定key
+				// 如果布隆过滤器返回false, 则一定不存在
+				// 返回true, 不一定存在
 				frel.Release()
 				return nil, nil, ErrNotFound
 			}
@@ -862,13 +891,15 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 		}
 	}
 
+	// 获取数据块迭代器
 	data := r.getDataIter(dataBH, nil, r.verifyChecksum, !ro.GetDontFillCache())
-	if !data.Seek(key) {
+	if !data.Seek(key) { // 找不到目标
 		data.Release()
 		if err = data.Error(); err != nil {
 			return
 		}
 
+		// 接着从下一个块开始找
 		// The nearest greater-than key is the first key of the next block.
 		if !index.Next() {
 			if err = index.Error(); err == nil {
@@ -894,7 +925,7 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 	}
 
 	// Key doesn't use block buffer, no need to copy the buffer.
-	rkey = data.Key()
+	rkey = data.Key() // 获取kv
 	if !noValue {
 		if r.bpool == nil {
 			value = data.Value()

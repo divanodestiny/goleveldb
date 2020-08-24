@@ -215,7 +215,9 @@ func (b *Batch) decode(data []byte, expectedLen int) error {
 func (b *Batch) putMem(seq uint64, mdb *memdb.DB) error {
 	var ik []byte
 	for i, index := range b.index {
+		// 构建internal key
 		ik = makeInternalKey(ik, index.k(b.data), seq+uint64(i), index.keyType)
+		// 写入跳表
 		if err := mdb.Put(ik, index.v(b.data)); err != nil {
 			return err
 		}
@@ -342,9 +344,12 @@ func batchesLen(batches []*Batch) int {
 }
 
 func writeBatchesWithHeader(wr io.Writer, batches []*Batch, seq uint64) error {
+	// 这里在journal中首先写入的header是第一个seq和kv对数量
+	// batch中每一个kv都是通过首序号和offset在计算实际的seq
 	if _, err := wr.Write(encodeBatchHeader(nil, seq, batchesLen(batches))); err != nil {
 		return err
 	}
+	// 写入batch数
 	for _, batch := range batches {
 		if _, err := wr.Write(batch.data); err != nil {
 			return err
